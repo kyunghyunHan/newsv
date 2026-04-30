@@ -162,6 +162,7 @@ struct OllamaRequest<'a> {
     prompt: String,
     system: &'a str,
     stream: bool,
+    keep_alive: i32, // 0 = 요약 후 즉시 언로드
     options: OllamaOptions,
 }
 
@@ -204,6 +205,7 @@ Bullet format: \"- summary\"\n\
         prompt,
         system: "You summarize financial news headlines. Use only the headlines and do not speculate.",
         stream: false,
+        keep_alive: 0,
         options: OllamaOptions {
             temperature: 0.2,
             num_predict: 220,
