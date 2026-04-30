@@ -1,11 +1,11 @@
 // stoki-news-server
-// VPS에서 실행. 15분마다 RSS 수집 + llama3 요약 → HTTP API 제공.
+// VPS에서 실행. 15분마다 RSS 수집 + gemma4:2b 요약 → HTTP API 제공.
 //
 // ┌─────────────────────────────────────────────────────────────────────┐
 // │  ENV 변수                                                           │
 // │  PORT           포트번호         (기본: 8765)                       │
 // │  OLLAMA_HOST    Ollama 주소       (기본: http://localhost:11434)     │
-// │  OLLAMA_MODEL   사용 모델         (기본: gemma3:2b)                 │
+// │  OLLAMA_MODEL   사용 모델         (기본: gemma4:2b)                 │
 // │  FETCH_INTERVAL 갱신 주기(초)     (기본: 900 = 15분)                │
 // └─────────────────────────────────────────────────────────────────────┘
 //
@@ -16,7 +16,7 @@
 // └─────────────────────────────────────────────────────────────────────┘
 //
 // VPS 빌드: cargo build --release
-// 실행:     PORT=8765 OLLAMA_MODEL=llama3 ./target/release/stoki-news-server
+// 실행:     PORT=8765 OLLAMA_MODEL=gemma4:2b ./target/release/stoki-news-server
 
 use axum::{
     extract::State,
@@ -33,7 +33,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
 // ---------------------------------------------------------------------------
-// 공유 데이터 타입 (JSON API 응답 = Stoki 앱이 기대하는 형식)
+// 공유 데이터 타입
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -42,13 +42,13 @@ pub struct NewsItem {
     pub source: String,
     pub pub_date: String,
     pub link: String,
-    pub category: String, // "stock" | "crypto"
+    pub category: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct NewsResponse {
     pub date: String,
-    pub fetched_at: String, // ISO8601 UTC
+    pub fetched_at: String,
     pub summary: Option<String>,
     pub items: Vec<NewsItem>,
 }
@@ -94,21 +94,25 @@ async fn fetch_all_rss(client: &reqwest::Client) -> Vec<NewsItem> {
 
     for &(src, url) in STOCK_SOURCES {
         match fetch_one(client, src, url, "stock").await {
-            Ok(items) => all.extend(items),
+            Ok(items) => {
+                println!("[rss] {src} → {}개", items.len());
+                all.extend(items);
+            }
             Err(e) => eprintln!("[rss] {src} 실패: {e}"),
         }
     }
     for &(src, url) in CRYPTO_SOURCES {
         match fetch_one(client, src, url, "crypto").await {
-            Ok(items) => all.extend(items),
+            Ok(items) => {
+                println!("[rss] {src} → {}개", items.len());
+                all.extend(items);
+            }
             Err(e) => eprintln!("[rss] {src} 실패: {e}"),
         }
     }
 
-    // 날짜 내림차순
     all.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
 
-    // 중복 제거 (링크/제목 기준)
     let mut seen_links = std::collections::HashSet::new();
     let mut seen_titles = std::collections::HashSet::new();
     all.retain(|item| {
@@ -153,7 +157,7 @@ async fn fetch_one(
 }
 
 // ---------------------------------------------------------------------------
-// Ollama 요약 (HTTP API 직접 호출)
+// Ollama 요약
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -162,7 +166,7 @@ struct OllamaRequest<'a> {
     prompt: String,
     system: &'a str,
     stream: bool,
-    keep_alive: i32, // 0 = 요약 후 즉시 언로드
+    keep_alive: i32,
     options: OllamaOptions,
 }
 
@@ -184,7 +188,7 @@ async fn summarize(client: &reqwest::Client, items: &[NewsItem]) -> Option<Strin
 
     let ollama_host = std::env::var("OLLAMA_HOST")
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma3:2b".to_string());
+    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:2b".to_string());
     let url = format!("{}/api/generate", ollama_host.trim_end_matches('/'));
 
     let mut list = String::new();
@@ -219,16 +223,23 @@ Bullet format: \"- summary\"\n\
         .send()
         .await
     {
-        Ok(resp) => match resp.json::<OllamaResponse>().await {
-            Ok(r) => {
-                let s = r.response.trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
+        Ok(resp) => {
+            let text = match resp.text().await {
+                Ok(t) => t,
+                Err(e) => { eprintln!("[summary] 응답 읽기 실패: {e}"); return None; }
+            };
+            match serde_json::from_str::<OllamaResponse>(&text) {
+                Ok(r) => {
+                    let s = r.response.trim().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                }
+                Err(e) => {
+                    eprintln!("[summary] 파싱 실패: {e}");
+                    eprintln!("[summary] Ollama 응답: {}", &text[..text.len().min(300)]);
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("[summary] 응답 파싱 실패: {e}");
-                None
-            }
-        },
+        }
         Err(e) => {
             eprintln!("[summary] Ollama 요청 실패 ({url}): {e}");
             None
@@ -237,7 +248,7 @@ Bullet format: \"- summary\"\n\
 }
 
 // ---------------------------------------------------------------------------
-// 갱신 루프 (백그라운드 태스크)
+// 갱신 루프
 // ---------------------------------------------------------------------------
 
 async fn refresh_loop(state: SharedState, interval_secs: u64) {
@@ -250,12 +261,12 @@ async fn refresh_loop(state: SharedState, interval_secs: u64) {
     loop {
         println!("[server] RSS 수집 시작...");
         let items = fetch_all_rss(&client).await;
-        println!("[server] {}개 뉴스 수집 완료. 요약 중...", items.len());
+        println!("[server] 총 {}개 수집 완료. 요약 중...", items.len());
 
         let summary = summarize(&client, &items).await;
         match &summary {
             Some(_) => println!("[server] 요약 완료."),
-            None => println!("[server] 요약 실패 — 뉴스만 제공."),
+            None    => println!("[server] 요약 실패 — 뉴스만 제공."),
         }
 
         let now = Utc::now();
@@ -278,7 +289,9 @@ async fn refresh_loop(state: SharedState, interval_secs: u64) {
 // ---------------------------------------------------------------------------
 
 async fn handle_news(State(state): State<SharedState>) -> Json<NewsResponse> {
-    Json(state.read().await.clone())
+    let news = state.read().await.clone();
+    println!("[server] /news 요청 → {}개 전송", news.items.len());
+    Json(news)
 }
 
 async fn handle_health() -> &'static str {
@@ -299,19 +312,18 @@ async fn main() {
     let interval: u64 = std::env::var("FETCH_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(900); // 기본 15분
+        .unwrap_or(900);
 
     println!("[server] stoki-news-server 시작");
     println!("[server] 포트: {port}  갱신주기: {interval}초");
     println!(
         "[server] Ollama: {}  모델: {}",
         std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string()),
-        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma3:2b".to_string()),
+        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:2b".to_string()),
     );
 
     let state: SharedState = Arc::new(RwLock::new(NewsResponse::default()));
 
-    // 최초 갱신을 즉시 실행
     {
         let s = state.clone();
         tokio::spawn(async move {
