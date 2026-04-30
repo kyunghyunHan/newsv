@@ -1,12 +1,14 @@
 // stoki-news-server
-// VPS에서 실행. 15분마다 RSS 수집 + gemma4:e2b 요약 → HTTP API 제공.
+// VPS에서 실행. 1시간마다 RSS 수집 + gemma4:e2b 요약 → HTTP API 제공.
 //
 // ┌─────────────────────────────────────────────────────────────────────┐
 // │  ENV 변수                                                           │
 // │  PORT           포트번호         (기본: 8765)                       │
 // │  OLLAMA_HOST    Ollama 주소       (기본: http://localhost:11434)     │
 // │  OLLAMA_MODEL   사용 모델         (기본: gemma4:e2b)                │
-// │  FETCH_INTERVAL 갱신 주기(초)     (기본: 900 = 15분)                │
+// │  OLLAMA_SERVICE Ollama 서비스명   (기본: ollama)                   │
+// │  MANAGE_OLLAMA  요약 전후 시작/중지 (기본: true)                   │
+// │  FETCH_INTERVAL 갱신 주기(초)     (기본: 3600 = 1시간)              │
 // │  SUMMARY_TIMEOUT 요약 제한(초)    (기본: 300)                      │
 // └─────────────────────────────────────────────────────────────────────┘
 //
@@ -17,19 +19,18 @@
 // └─────────────────────────────────────────────────────────────────────┘
 //
 // VPS 빌드: cargo build --release
-// 실행:     PORT=8765 OLLAMA_MODEL=gemma4:e2b ./target/release/stoki-news-server
+// 실행:     PORT=8765 OLLAMA_MODEL=gemma4:e2b ./target/release/newsv
 
-use axum::{
-    extract::State,
-    http::Method,
-    response::Json,
-    routing::get,
-    Router,
-};
+use axum::{extract::State, http::Method, response::Json, routing::get, Router};
 use chrono::Utc;
 use rss::Channel;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::process::Command;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -77,7 +78,10 @@ const STOCK_SOURCES: &[(&str, &str)] = &[
 ];
 
 const CRYPTO_SOURCES: &[(&str, &str)] = &[
-    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    (
+        "CoinDesk",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    ),
     ("CoinTelegraph", "https://cointelegraph.com/rss"),
     (
         "Google Crypto",
@@ -194,13 +198,98 @@ struct OllamaError {
     error: String,
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+async fn systemctl(action: &str, service: &str) -> bool {
+    match Command::new("systemctl")
+        .arg(action)
+        .arg(service)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            println!("[ollama] systemctl {action} {service} 완료");
+            true
+        }
+        Ok(output) => {
+            eprintln!(
+                "[ollama] systemctl {action} {service} 실패: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("[ollama] systemctl 실행 실패: {e}");
+            false
+        }
+    }
+}
+
+async fn wait_ollama_ready(client: &reqwest::Client, ollama_host: &str) -> bool {
+    let url = format!("{}/api/tags", ollama_host.trim_end_matches('/'));
+    let started = Instant::now();
+
+    while started.elapsed() < Duration::from_secs(30) {
+        if let Ok(resp) = client
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                println!("[ollama] 준비 완료: {url}");
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    eprintln!("[ollama] 준비 대기 시간 초과: {url}");
+    false
+}
+
+async fn start_ollama_for_summary(client: &reqwest::Client) -> bool {
+    if !env_bool("MANAGE_OLLAMA", true) {
+        return true;
+    }
+
+    let service = std::env::var("OLLAMA_SERVICE").unwrap_or_else(|_| "ollama".to_string());
+    let ollama_host =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+
+    println!("[ollama] 요약을 위해 서비스 시작: {service}");
+    let started = systemctl("start", &service).await;
+    let ready = wait_ollama_ready(client, &ollama_host).await;
+
+    started && ready
+}
+
+async fn stop_ollama_after_summary() {
+    if !env_bool("MANAGE_OLLAMA", true) {
+        return;
+    }
+
+    let service = std::env::var("OLLAMA_SERVICE").unwrap_or_else(|_| "ollama".to_string());
+    println!("[ollama] 요약 완료 후 서비스 중지: {service}");
+    systemctl("stop", &service).await;
+}
+
 async fn summarize(client: &reqwest::Client, items: &[NewsItem]) -> Option<String> {
     if items.is_empty() {
         return None;
     }
 
-    let ollama_host = std::env::var("OLLAMA_HOST")
-        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let ollama_host =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
     let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e2b".to_string());
     let timeout_secs = std::env::var("SUMMARY_TIMEOUT")
         .ok()
@@ -224,19 +313,18 @@ Bullet format: \"- summary\"\n\
     let body = OllamaRequest {
         model: &model,
         prompt,
-        system: "You summarize financial news headlines. Use only the headlines and do not speculate.",
+        system:
+            "You summarize financial news headlines. Use only the headlines and do not speculate.",
         stream: false,
         think: false,
-        keep_alive: "30m",
+        keep_alive: "0",
         options: OllamaOptions {
             temperature: 0.2,
             num_predict: 512,
         },
     };
 
-    println!(
-        "[summary] Ollama 요청 시작: model={model}, url={url}, timeout={timeout_secs}s"
-    );
+    println!("[summary] Ollama 요청 시작: model={model}, url={url}, timeout={timeout_secs}s");
 
     let started = Instant::now();
 
@@ -251,7 +339,10 @@ Bullet format: \"- summary\"\n\
             let status = resp.status();
             let text = match resp.text().await {
                 Ok(t) => t,
-                Err(e) => { eprintln!("[summary] 응답 읽기 실패: {e}"); return None; }
+                Err(e) => {
+                    eprintln!("[summary] 응답 읽기 실패: {e}");
+                    return None;
+                }
             };
 
             if !status.is_success() {
@@ -292,7 +383,10 @@ Bullet format: \"- summary\"\n\
                 }
                 Err(e) => {
                     eprintln!("[summary] 파싱 실패: {e}");
-                    eprintln!("[summary] Ollama 응답: {}", text.chars().take(300).collect::<String>());
+                    eprintln!(
+                        "[summary] Ollama 응답: {}",
+                        text.chars().take(300).collect::<String>()
+                    );
                     None
                 }
             }
@@ -330,10 +424,19 @@ async fn refresh_loop(state: SharedState, interval_secs: u64) {
         };
         println!("[server] 뉴스 캐시 선갱신 완료. 기존 요약 유지.");
 
-        let summary = summarize(&client, &items).await;
+        let summary = if start_ollama_for_summary(&client).await {
+            let summary = summarize(&client, &items).await;
+            stop_ollama_after_summary().await;
+            summary
+        } else {
+            eprintln!("[ollama] 시작 실패 — 요약 건너뜀.");
+            stop_ollama_after_summary().await;
+            None
+        };
+
         match &summary {
             Some(_) => println!("[server] 요약 완료."),
-            None    => println!("[server] 요약 실패 — 기존 요약 유지."),
+            None => println!("[server] 요약 실패 — 기존 요약 유지."),
         }
 
         let now = Utc::now();
@@ -379,7 +482,7 @@ async fn main() {
     let interval: u64 = std::env::var("FETCH_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(900);
+        .unwrap_or(3600);
 
     let summary_timeout: u64 = std::env::var("SUMMARY_TIMEOUT")
         .ok()
@@ -389,9 +492,10 @@ async fn main() {
     println!("[server] stoki-news-server 시작");
     println!("[server] 포트: {port}  갱신주기: {interval}초  요약제한: {summary_timeout}초");
     println!(
-        "[server] Ollama: {}  모델: {}",
+        "[server] Ollama: {}  모델: {}  서비스관리: {}",
         std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string()),
         std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e2b".to_string()),
+        env_bool("MANAGE_OLLAMA", true),
     );
 
     let state: SharedState = Arc::new(RwLock::new(NewsResponse::default()));
