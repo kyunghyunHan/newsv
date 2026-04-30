@@ -320,26 +320,27 @@ async fn refresh_loop(state: SharedState, interval_secs: u64) {
         let items = fetch_all_rss(&client).await;
         println!("[server] 총 {}개 수집 완료. 요약 중...", items.len());
 
+        let previous_summary = state.read().await.summary.clone();
         let now = Utc::now();
         *state.write().await = NewsResponse {
             date: now.format("%Y-%m-%d").to_string(),
             fetched_at: now.to_rfc3339(),
-            summary: None,
+            summary: previous_summary.clone(),
             items: items.clone(),
         };
-        println!("[server] 뉴스 캐시 선갱신 완료. 요약 대기 중.");
+        println!("[server] 뉴스 캐시 선갱신 완료. 기존 요약 유지.");
 
         let summary = summarize(&client, &items).await;
         match &summary {
             Some(_) => println!("[server] 요약 완료."),
-            None    => println!("[server] 요약 실패 — 뉴스만 제공."),
+            None    => println!("[server] 요약 실패 — 기존 요약 유지."),
         }
 
         let now = Utc::now();
         let payload = NewsResponse {
             date: now.format("%Y-%m-%d").to_string(),
             fetched_at: now.to_rfc3339(),
-            summary,
+            summary: summary.or(previous_summary),
             items,
         };
 
