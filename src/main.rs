@@ -1,11 +1,11 @@
 // stoki-news-server
-// VPS에서 실행. 15분마다 RSS 수집 + gemma4:2b 요약 → HTTP API 제공.
+// VPS에서 실행. 15분마다 RSS 수집 + gemma4:e2b 요약 → HTTP API 제공.
 //
 // ┌─────────────────────────────────────────────────────────────────────┐
 // │  ENV 변수                                                           │
 // │  PORT           포트번호         (기본: 8765)                       │
 // │  OLLAMA_HOST    Ollama 주소       (기본: http://localhost:11434)     │
-// │  OLLAMA_MODEL   사용 모델         (기본: gemma4:2b)                 │
+// │  OLLAMA_MODEL   사용 모델         (기본: gemma4:e2b)                │
 // │  FETCH_INTERVAL 갱신 주기(초)     (기본: 900 = 15분)                │
 // └─────────────────────────────────────────────────────────────────────┘
 //
@@ -16,7 +16,7 @@
 // └─────────────────────────────────────────────────────────────────────┘
 //
 // VPS 빌드: cargo build --release
-// 실행:     PORT=8765 OLLAMA_MODEL=gemma4:2b ./target/release/stoki-news-server
+// 실행:     PORT=8765 OLLAMA_MODEL=gemma4:e2b ./target/release/stoki-news-server
 
 use axum::{
     extract::State,
@@ -188,7 +188,7 @@ async fn summarize(client: &reqwest::Client, items: &[NewsItem]) -> Option<Strin
 
     let ollama_host = std::env::var("OLLAMA_HOST")
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:2b".to_string());
+    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e2b".to_string());
     let url = format!("{}/api/generate", ollama_host.trim_end_matches('/'));
 
     let mut list = String::new();
@@ -319,7 +319,7 @@ async fn main() {
     println!(
         "[server] Ollama: {}  모델: {}",
         std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string()),
-        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:2b".to_string()),
+        std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e2b".to_string()),
     );
 
     let state: SharedState = Arc::new(RwLock::new(NewsResponse::default()));
