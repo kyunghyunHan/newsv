@@ -29,7 +29,7 @@ use axum::{
 use chrono::Utc;
 use rss::Channel;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -180,6 +180,11 @@ struct OllamaOptions {
 #[derive(Deserialize)]
 struct OllamaResponse {
     response: String,
+    done: Option<bool>,
+    total_duration: Option<u64>,
+    load_duration: Option<u64>,
+    prompt_eval_count: Option<u32>,
+    eval_count: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +235,8 @@ Bullet format: \"- summary\"\n\
         "[summary] Ollama 요청 시작: model={model}, url={url}, timeout={timeout_secs}s"
     );
 
+    let started = Instant::now();
+
     match client
         .post(&url)
         .json(&body)
@@ -258,11 +265,30 @@ Bullet format: \"- summary\"\n\
             match serde_json::from_str::<OllamaResponse>(&text) {
                 Ok(r) => {
                     let s = r.response.trim().to_string();
-                    if s.is_empty() { None } else { Some(s) }
+                    if s.is_empty() {
+                        eprintln!(
+                            "[summary] Ollama 빈 응답: elapsed={}s done={:?} total_ms={:?} load_ms={:?} prompt_tokens={:?} output_tokens={:?}",
+                            started.elapsed().as_secs(),
+                            r.done,
+                            r.total_duration.map(|n| n / 1_000_000),
+                            r.load_duration.map(|n| n / 1_000_000),
+                            r.prompt_eval_count,
+                            r.eval_count,
+                        );
+                        None
+                    } else {
+                        println!(
+                            "[summary] Ollama 응답 완료: elapsed={}s chars={} output_tokens={:?}",
+                            started.elapsed().as_secs(),
+                            s.chars().count(),
+                            r.eval_count,
+                        );
+                        Some(s)
+                    }
                 }
                 Err(e) => {
                     eprintln!("[summary] 파싱 실패: {e}");
-                    eprintln!("[summary] Ollama 응답: {}", &text[..text.len().min(300)]);
+                    eprintln!("[summary] Ollama 응답: {}", text.chars().take(300).collect::<String>());
                     None
                 }
             }
