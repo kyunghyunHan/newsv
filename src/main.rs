@@ -167,6 +167,7 @@ struct OllamaRequest<'a> {
     prompt: String,
     system: &'a str,
     stream: bool,
+    think: bool,
     keep_alive: &'a str,
     options: OllamaOptions,
 }
@@ -180,6 +181,7 @@ struct OllamaOptions {
 #[derive(Deserialize)]
 struct OllamaResponse {
     response: String,
+    thinking: Option<String>,
     done: Option<bool>,
     total_duration: Option<u64>,
     load_duration: Option<u64>,
@@ -224,10 +226,11 @@ Bullet format: \"- summary\"\n\
         prompt,
         system: "You summarize financial news headlines. Use only the headlines and do not speculate.",
         stream: false,
+        think: false,
         keep_alive: "30m",
         options: OllamaOptions {
             temperature: 0.2,
-            num_predict: 220,
+            num_predict: 512,
         },
     };
 
@@ -267,13 +270,14 @@ Bullet format: \"- summary\"\n\
                     let s = r.response.trim().to_string();
                     if s.is_empty() {
                         eprintln!(
-                            "[summary] Ollama 빈 응답: elapsed={}s done={:?} total_ms={:?} load_ms={:?} prompt_tokens={:?} output_tokens={:?}",
+                            "[summary] Ollama 빈 응답: elapsed={}s done={:?} total_ms={:?} load_ms={:?} prompt_tokens={:?} output_tokens={:?} thinking_chars={}",
                             started.elapsed().as_secs(),
                             r.done,
                             r.total_duration.map(|n| n / 1_000_000),
                             r.load_duration.map(|n| n / 1_000_000),
                             r.prompt_eval_count,
                             r.eval_count,
+                            r.thinking.as_deref().unwrap_or("").chars().count(),
                         );
                         None
                     } else {
