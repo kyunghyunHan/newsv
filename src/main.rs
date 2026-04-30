@@ -7,6 +7,7 @@
 // │  OLLAMA_HOST    Ollama 주소       (기본: http://localhost:11434)     │
 // │  OLLAMA_MODEL   사용 모델         (기본: gemma4:e2b)                │
 // │  FETCH_INTERVAL 갱신 주기(초)     (기본: 900 = 15분)                │
+// │  SUMMARY_TIMEOUT 요약 제한(초)    (기본: 300)                      │
 // └─────────────────────────────────────────────────────────────────────┘
 //
 // ┌─────────────────────────────────────────────────────────────────────┐
@@ -166,7 +167,7 @@ struct OllamaRequest<'a> {
     prompt: String,
     system: &'a str,
     stream: bool,
-    keep_alive: i32,
+    keep_alive: &'a str,
     options: OllamaOptions,
 }
 
@@ -181,6 +182,11 @@ struct OllamaResponse {
     response: String,
 }
 
+#[derive(Deserialize)]
+struct OllamaError {
+    error: String,
+}
+
 async fn summarize(client: &reqwest::Client, items: &[NewsItem]) -> Option<String> {
     if items.is_empty() {
         return None;
@@ -189,6 +195,10 @@ async fn summarize(client: &reqwest::Client, items: &[NewsItem]) -> Option<Strin
     let ollama_host = std::env::var("OLLAMA_HOST")
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
     let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e2b".to_string());
+    let timeout_secs = std::env::var("SUMMARY_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
     let url = format!("{}/api/generate", ollama_host.trim_end_matches('/'));
 
     let mut list = String::new();
@@ -209,25 +219,42 @@ Bullet format: \"- summary\"\n\
         prompt,
         system: "You summarize financial news headlines. Use only the headlines and do not speculate.",
         stream: false,
-        keep_alive: 0,
+        keep_alive: "30m",
         options: OllamaOptions {
             temperature: 0.2,
             num_predict: 220,
         },
     };
 
+    println!(
+        "[summary] Ollama 요청 시작: model={model}, url={url}, timeout={timeout_secs}s"
+    );
+
     match client
         .post(&url)
         .json(&body)
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
     {
         Ok(resp) => {
+            let status = resp.status();
             let text = match resp.text().await {
                 Ok(t) => t,
                 Err(e) => { eprintln!("[summary] 응답 읽기 실패: {e}"); return None; }
             };
+
+            if !status.is_success() {
+                match serde_json::from_str::<OllamaError>(&text) {
+                    Ok(err) => eprintln!("[summary] Ollama 오류 HTTP {status}: {}", err.error),
+                    Err(_) => eprintln!(
+                        "[summary] Ollama 오류 HTTP {status}: {}",
+                        &text[..text.len().min(500)]
+                    ),
+                }
+                return None;
+            }
+
             match serde_json::from_str::<OllamaResponse>(&text) {
                 Ok(r) => {
                     let s = r.response.trim().to_string();
@@ -262,6 +289,15 @@ async fn refresh_loop(state: SharedState, interval_secs: u64) {
         println!("[server] RSS 수집 시작...");
         let items = fetch_all_rss(&client).await;
         println!("[server] 총 {}개 수집 완료. 요약 중...", items.len());
+
+        let now = Utc::now();
+        *state.write().await = NewsResponse {
+            date: now.format("%Y-%m-%d").to_string(),
+            fetched_at: now.to_rfc3339(),
+            summary: None,
+            items: items.clone(),
+        };
+        println!("[server] 뉴스 캐시 선갱신 완료. 요약 대기 중.");
 
         let summary = summarize(&client, &items).await;
         match &summary {
@@ -314,8 +350,13 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(900);
 
+    let summary_timeout: u64 = std::env::var("SUMMARY_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+
     println!("[server] stoki-news-server 시작");
-    println!("[server] 포트: {port}  갱신주기: {interval}초");
+    println!("[server] 포트: {port}  갱신주기: {interval}초  요약제한: {summary_timeout}초");
     println!(
         "[server] Ollama: {}  모델: {}",
         std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string()),
